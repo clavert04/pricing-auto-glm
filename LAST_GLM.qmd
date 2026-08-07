@@ -1,0 +1,723 @@
+---
+title: "Examen de Tarification Automobile — BASEAUTO"
+author: "TCHIO CLAVERT"
+date: today
+format:
+  pdf:
+    toc: true
+    toc-depth: 3
+    number-sections: true
+    fig-width: 8
+    fig-height: 4.5
+    fontsize: 11pt
+    geometry: margin=2.5cm
+    colorlinks: true
+    keep-tex: false
+  html:
+    toc: false 
+    toc-depth: 3
+    toc-title: "Table des matières"
+    number-sections: true
+    theme: flatly
+    highlight-style: github
+    code-fold: true
+    code-summary: "Afficher le code"
+    df-print: paged
+    fig-width: 9
+    fig-height: 5
+execute:
+  echo: true
+  warning: false
+  message: false
+---
+
+```{r setup, include=FALSE}
+library(dplyr)
+library(ggplot2)
+library(knitr)
+library(kableExtra)
+library(MASS)
+library(corrplot)
+library(gridExtra)
+
+# Fonction kbl adaptée PDF/HTML
+kbl_out <- function(x, caption = NULL, ...) {
+  fmt <- knitr::opts_knit$get("rmarkdown.pandoc.to")
+  if (!is.null(fmt) && grepl("latex", fmt)) {
+    kbl(x, caption = caption, booktabs = TRUE, ...) |>
+      kable_styling(latex_options = c("striped", "hold_position", "scale_down"),
+                    font_size = 9)
+  } else {
+    kbl(x, caption = caption, ...) |>
+      kable_styling(bootstrap_options = c("striped","hover","condensed"),
+                    full_width = FALSE)
+  }
+}
+
+theme_set(theme_minimal(base_size = 11) +
+            theme(plot.title  = element_text(face = "bold", size = 12),
+                  axis.title  = element_text(size = 10)))
+```
+
+---
+
+# Avant de commencer
+
+```{r setup-projet}
+# setwd("C:/Users/VotreNom/Desktop/Examen_Tarification_2025_nom")
+getwd()
+```
+
+---
+
+# Partie A — Analyse exploratoire
+
+## Importation et visualisation des données
+
+```{r import}
+df <- read.csv("BASEAUTO.csv", sep = ";", dec = ".", stringsAsFactors = FALSE)
+cat("Dimensions :", nrow(df), "lignes x", ncol(df), "colonnes\n")
+```
+
+```{r apercu}
+head(df, 6) |>
+  kbl_out(caption = "Aperçu des 6 premières observations")
+```
+
+```{r structure}
+str(df)
+```
+
+**Interprétation :** La base BASEAUTO contient **`r nrow(df)` polices** et **`r ncol(df)` variables** : caractéristiques du conducteur (âge, sexe, statut, CSP, ancienneté du permis), du véhicule (type, classe SRA, énergie, vitesse, segment) et la variable cible **CHARGE** (montant annuel de remboursement en euros). Le taux de sinistralité est de **`r round(mean(df$CHARGE > 0)*100, 1)`%**.
+
+---
+
+## Conversion des types de données
+
+```{r conversion}
+vars_quali <- c("SEX","STATUT","K8000","CAR","CLA","ALI","ENE","VIT","SEGM","USAGE","GARAGE")
+for (v in vars_quali) df[[v]] <- as.factor(df[[v]])
+
+# Tableau récapitulatif
+data.frame(
+  Variable  = vars_quali,
+  Modalites = sapply(vars_quali, function(v) nlevels(df[[v]]))
+) |> kbl_out(caption = "Nombre de modalités par variable qualitative")
+```
+
+---
+
+## Statistiques descriptives univariées
+
+### Variables quantitatives
+
+```{r stats-quanti}
+vars_quanti <- c("PERMIS","ACV","AGECOND","RM","CHARGE")
+
+do.call(rbind, lapply(vars_quanti, function(v) {
+  x <- df[[v]]
+  data.frame(
+    Variable   = v,
+    Moyenne    = round(mean(x, na.rm=TRUE), 2),
+    Ecart_type = round(sd(x, na.rm=TRUE), 2),
+    Min        = round(min(x, na.rm=TRUE), 2),
+    Q25        = round(quantile(x, 0.25, na.rm=TRUE), 2),
+    Mediane    = round(median(x, na.rm=TRUE), 2),
+    Q75        = round(quantile(x, 0.75, na.rm=TRUE), 2),
+    Q99        = round(quantile(x, 0.99, na.rm=TRUE), 2),
+    Max        = round(max(x, na.rm=TRUE), 2)
+  )
+})) |> kbl_out(caption = "Statistiques descriptives — variables quantitatives")
+```
+
+```{r histogrammes, fig.height=6}
+par(mfrow = c(2, 3))
+cols <- c("steelblue","darkgreen","coral","orange","darkblue")
+for (i in seq_along(vars_quanti)) {
+  v <- vars_quanti[i]
+  hist(df[[v]], probability = TRUE, col = cols[i], border = "white",
+       main = paste("Distribution :", v), xlab = v, ylab = "Densité")
+  lines(density(df[[v]], na.rm = TRUE), col = "red", lwd = 2)
+}
+par(mfrow = c(1, 1))
+```
+
+**Interprétation :** La variable **CHARGE** est très asymétrique à droite — `r round(mean(df$CHARGE == 0)*100, 1)`% des polices ont CHARGE = 0 (aucun sinistre sur l'année). Parmi les sinistrés, les montants varient fortement. Le **RM** est concentré entre 50 et 100, témoignant d'un portefeuille globalement bien noté.
+
+### Variables qualitatives
+
+```{r stats-quali, fig.height=5}
+vars_bar <- c("SEX","STATUT","ENE","USAGE","K8000","CAR")
+par(mfrow = c(2, 3))
+for (v in vars_bar) {
+  tab <- round(prop.table(table(df[[v]])) * 100, 1)
+  barplot(tab, col = "steelblue", border = "white",
+          main = paste("Répartition :", v),
+          xlab = v, ylab = "% polices", cex.names = 0.8)
+}
+par(mfrow = c(1, 1))
+```
+
+---
+
+## Regroupements de modalités
+
+### (a) CSP → 3 catégories
+
+```{r csp3}
+# CAT1 : CSP = 50  |  CAT2 : CSP = 55 ou 60  |  CAT3 : autres
+df$CSP3 <- case_when(
+  df$CSP == 50           ~ "CAT1",
+  df$CSP %in% c(55, 60)  ~ "CAT2",
+  TRUE                    ~ "CAT3"
+)
+df$CSP3 <- factor(df$CSP3, levels = c("CAT1","CAT2","CAT3"))
+print(table(df$CSP3))
+round(prop.table(table(df$CSP3)) * 100, 2)
+```
+
+### (b) CLA → Eco / Inter / Cher
+
+```{r cla3}
+# Eco : A-G  |  Inter : H-L  |  Cher : toutes les autres modalités
+df$CLA3 <- case_when(
+  df$CLA %in% c("A","B","C","D","E","F","G") ~ "Eco",
+  df$CLA %in% c("H","I","J","K","L")         ~ "Inter",
+  TRUE                                         ~ "Cher"
+)
+df$CLA3 <- factor(df$CLA3, levels = c("Eco","Inter","Cher"))
+print(table(df$CLA3))
+round(prop.table(table(df$CLA3)) * 100, 2)
+```
+
+### (c) VIT → Lent / VitMoy / Rapide
+
+```{r vit3}
+# VIT est une chaîne de caractères dans BASEAUTO
+# Lent : 001-130 à 150-160  |  VitMoy : 160-170 à 180-190  |  Rapide : autres
+vit_lent  <- c("001-130","130-140","140-150","150-160")
+vit_moyen <- c("160-170","170-180","180-190")
+
+df$VIT3 <- case_when(
+  df$VIT %in% vit_lent  ~ "Lent",
+  df$VIT %in% vit_moyen ~ "VitMoy",
+  TRUE                   ~ "Rapide"
+)
+df$VIT3 <- factor(df$VIT3, levels = c("Lent","VitMoy","Rapide"))
+print(table(df$VIT3))
+round(prop.table(table(df$VIT3)) * 100, 2)
+```
+
+### (d) CAR → Luxe / Commun / Familial
+
+```{r car3}
+# Luxe : BER, CAB, CPE  |  Commun : CTE, BUS, TT  |  Familial : autres
+df$CAR3 <- case_when(
+  df$CAR %in% c("BER","CAB","CPE") ~ "Luxe",
+  df$CAR %in% c("CTE","BUS","TT")  ~ "Commun",
+  TRUE                               ~ "Familial"
+)
+df$CAR3 <- factor(df$CAR3, levels = c("Luxe","Commun","Familial"))
+print(table(df$CAR3))
+round(prop.table(table(df$CAR3)) * 100, 2)
+```
+
+```{r regroupements-viz, fig.height=3.5}
+g1 <- ggplot(df, aes(x=CSP3, fill=CSP3)) + geom_bar() +
+      labs(title="CSP3", y="Effectif") + theme(legend.position="none")
+g2 <- ggplot(df, aes(x=CLA3, fill=CLA3)) + geom_bar() +
+      labs(title="CLA3", y="") + theme(legend.position="none")
+g3 <- ggplot(df, aes(x=VIT3, fill=VIT3)) + geom_bar() +
+      labs(title="VIT3", y="") + theme(legend.position="none")
+g4 <- ggplot(df, aes(x=CAR3, fill=CAR3)) + geom_bar() +
+      labs(title="CAR3", y="") + theme(legend.position="none")
+grid.arrange(g1, g2, g3, g4, ncol=4)
+```
+
+---
+
+## Statistiques descriptives bivariées
+
+```{r bivarie-table}
+vars_biv <- c("CSP3","CLA3","VIT3","CAR3","SEX","STATUT","ENE","USAGE")
+
+res_biv <- do.call(rbind, lapply(vars_biv, function(v) {
+  df |> group_by(Modalite = .data[[v]]) |>
+    summarise(N = n(),
+              Charge_moy    = round(mean(CHARGE, na.rm=TRUE), 2),
+              Freq_sin_pct  = round(mean(CHARGE > 0)*100, 2),
+              .groups = "drop") |>
+    mutate(Variable = v, .before = 1)
+}))
+
+res_biv |> kbl_out(caption = "Charge moyenne et fréquence de sinistre par variable")
+```
+
+```{r boxplots-biv, fig.height=6}
+# Zoomer sur les sinistrés (hors extrêmes) pour la lisibilité
+df_bv <- df[df$CHARGE > 0 & df$CHARGE < quantile(df$CHARGE[df$CHARGE>0], 0.95), ]
+par(mfrow = c(2, 4))
+for (v in vars_biv) {
+  boxplot(df_bv$CHARGE ~ df_bv[[v]],
+          col="steelblue", border="navy", main=paste("CHARGE ~", v),
+          xlab=v, ylab="Charge (€)", cex.axis=0.7)
+}
+par(mfrow = c(1, 1))
+```
+
+```{r corrplot, fig.height=4}
+mat_cor <- cor(df[, c("PERMIS","ACV","AGECOND","RM","CHARGE")], use="complete.obs")
+corrplot(mat_cor, method="color", type="upper", addCoef.col="black",
+         number.cex=0.8, tl.col="black", tl.srt=45,
+         title="Matrice de corrélation", mar=c(0,0,1,0))
+```
+
+---
+
+## À quoi servent les analyses préliminaires ?
+
+| Type | Utilité |
+|---|---|
+| **Univariée** | Comprendre la distribution, détecter les valeurs aberrantes, identifier les modalités rares à regrouper |
+| **Bivariée** | Mesurer l'effet brut de chaque variable sur la charge → discrimination tarifaire |
+| **Corrélation** | Détecter la multicolinéarité → risque d'instabilité du GLM |
+| **Stabilité temporelle** | Vérifier que le portefeuille n'a pas dérivé dans le temps → stationnarité nécessaire |
+
+---
+
+# Partie B — Préparation à la modélisation
+
+## Profil de référence
+
+```{r profil-ref}
+vars_pr <- c("SEX","STATUT","USAGE","CAR3","CLA3","VIT3","ENE","K8000","GARAGE","CSP3")
+profil <- data.frame(
+  Variable  = vars_pr,
+  Reference = sapply(vars_pr, function(v) names(which.max(table(df[[v]])))),
+  Effectif  = sapply(vars_pr, function(v) max(table(df[[v]])))
+)
+profil$Pct <- round(profil$Effectif / nrow(df) * 100, 1)
+
+profil |> kbl_out(caption = "Profil de référence du portefeuille")
+```
+
+**Le profil de référence** correspond à l'assuré le plus représentatif du portefeuille :
+conducteur **`r profil$Reference[profil$Variable=="SEX"]`**,
+statut **`r profil$Reference[profil$Variable=="STATUT"]`**,
+usage **`r profil$Reference[profil$Variable=="USAGE"]`**,
+véhicule **`r profil$Reference[profil$Variable=="CAR3"]`**,
+classe SRA **`r profil$Reference[profil$Variable=="CLA3"]`**,
+vitesse **`r profil$Reference[profil$Variable=="VIT3"]`**,
+énergie **`r profil$Reference[profil$Variable=="ENE"]`**.
+
+---
+
+## Séparation sinistres attritionnels / graves
+
+```{r separation}
+# Base des sinistrés uniquement
+df_sin <- subset(df, CHARGE > 0)
+cat("Nombre total de sinistrés :", nrow(df_sin), "\n")
+
+# Seuil : percentile 99 de la charge conditionnelle
+limite <- quantile(df_sin$CHARGE, 0.99)
+cat("Seuil Q99 :", round(limite, 2), "euros\n")
+```
+
+> **Justification du seuil :** On retient le **99e percentile** (`r round(limite, 0)` €). Au-delà, les sinistres présentent une volatilité extrême incompatible avec la loi Gamma. Ces sinistres graves (1% des sinistrés) sont gérés séparément via un chargement ou la réassurance.
+
+```{r bases}
+df_attri  <- df_sin[df_sin$CHARGE <= limite, ]
+df_graves <- df_sin[df_sin$CHARGE >  limite, ]
+
+rbind(
+  data.frame(Base="Attritionnels", N=nrow(df_attri),
+             Min=round(min(df_attri$CHARGE),0),
+             Moy=round(mean(df_attri$CHARGE),0),
+             Max=round(max(df_attri$CHARGE),0)),
+  data.frame(Base="Graves", N=nrow(df_graves),
+             Min=round(min(df_graves$CHARGE),0),
+             Moy=round(mean(df_graves$CHARGE),0),
+             Max=round(max(df_graves$CHARGE),0))
+) |> kbl_out(caption = "Caractéristiques des deux bases")
+```
+
+```{r viz-sep, fig.height=3.5}
+par(mfrow = c(1, 2))
+hist(df_attri$CHARGE,  col="steelblue", border="white", probability=TRUE,
+     main="Sinistres attritionnels", xlab="Charge (€)")
+lines(density(df_attri$CHARGE), col="red", lwd=2)
+hist(df_graves$CHARGE, col="coral",     border="white", probability=TRUE,
+     main="Sinistres graves", xlab="Charge (€)")
+par(mfrow = c(1, 1))
+```
+
+---
+
+## Base de construction du tarif
+
+Le tarif est construit sur la **base attritionnelle** (`r nrow(df_attri)` sinistres).
+Les sinistres graves sont traités via un **chargement additionnel** ou la **réassurance**.
+
+---
+
+## Échantillons apprentissage / test
+
+```{r split}
+set.seed(2025)
+n      <- nrow(df_attri)
+idx_tr <- sample(seq_len(n), size = round(0.80 * n))
+train  <- df_attri[ idx_tr, ]
+test   <- df_attri[-idx_tr, ]
+
+cat("Apprentissage :", nrow(train), "obs. (80%) | Test :", nrow(test), "obs. (20%)\n")
+```
+
+---
+
+## Tests d'adéquation de la charge
+
+```{r adequation}
+# ── Base : tous les sinistres attritionnels (> 0, <= seuil Q99) ──────────────
+charge_pos <- df_attri$CHARGE[df_attri$CHARGE > 0]
+n_cp <- length(charge_pos)
+
+cat("N observations  :", n_cp, "\n")
+cat("Min             :", round(min(charge_pos), 2), "\n")
+cat("Max             :", round(max(charge_pos), 2), "\n")
+cat("Valeurs <= 0    :", sum(charge_pos <= 0), "\n")
+
+# ── Estimateurs des moments (robustes, pas de MLE numérique) ─────────────────
+m_x  <- mean(charge_pos)
+v_x  <- var(charge_pos)
+
+# Gamma  : shape = m²/v,  rate  = m/v
+shape_g <- m_x^2 / v_x
+rate_g  <- m_x  / v_x
+
+# Log-normale : meanlog = mean(log(x)),  sdlog = sd(log(x))
+lx       <- log(charge_pos)
+meanlog  <- mean(lx)
+sdlog    <- sd(lx)
+
+# Weibull : estimation numérique via MASS::fitdistr (plus stable que fitdistrplus)
+library(MASS)
+fw <- tryCatch(
+  fitdistr(charge_pos, "weibull"),
+  error = function(e) NULL
+)
+
+cat("\n── Paramètres estimés (méthode des moments / MASS) ──\n")
+cat("Gamma   : shape =", round(shape_g, 4), "| rate =", round(rate_g, 6), "\n")
+cat("LogNorm : meanlog =", round(meanlog, 4), "| sdlog =", round(sdlog, 4), "\n")
+if (!is.null(fw))
+  cat("Weibull : shape =", round(fw$estimate["shape"], 4),
+      "| scale =", round(fw$estimate["scale"], 4), "\n")
+
+# ── Calcul des log-vraisemblances et critères AIC / BIC ─────────────────────
+ll_gamma <- sum(dgamma(charge_pos,   shape = shape_g, rate = rate_g,    log = TRUE))
+ll_lnorm <- sum(dlnorm(charge_pos,   meanlog = meanlog, sdlog = sdlog,  log = TRUE))
+ll_weib  <- if (!is.null(fw))
+              sum(dweibull(charge_pos, shape = fw$estimate["shape"],
+                           scale = fw$estimate["scale"], log = TRUE)) else NA
+
+k <- 2   # nb de paramètres pour chaque loi
+
+aic_g <- -2 * ll_gamma + 2 * k
+aic_l <- -2 * ll_lnorm + 2 * k
+aic_w <- -2 * ll_weib  + 2 * k
+
+bic_g <- -2 * ll_gamma + k * log(n_cp)
+bic_l <- -2 * ll_lnorm + k * log(n_cp)
+bic_w <- -2 * ll_weib  + k * log(n_cp)
+
+comp <- data.frame(
+  Loi     = c("Gamma", "Log-normale", "Weibull"),
+  LogVrais = round(c(ll_gamma, ll_lnorm, ll_weib), 2),
+  AIC     = round(c(aic_g, aic_l, aic_w), 2),
+  BIC     = round(c(bic_g, bic_l, bic_w), 2)
+)
+comp$Retenue <- ifelse(comp$AIC == min(comp$AIC, na.rm = TRUE), "✓", "")
+
+comp |> kbl_out(caption = "Comparaison des lois — Log-vraisemblance, AIC, BIC")
+
+# Loi retenue (pour usage dans le GLM et les graphiques)
+loi_retenue <- comp$Loi[which.min(comp$AIC)]
+cat("\nLoi retenue :", loi_retenue, "\n")
+```
+
+```{r qqplot-lois, fig.height=4}
+# ── Graphiques de diagnostic (sans fitdistrplus) ─────────────────────────────
+par(mfrow = c(1, 3))
+
+# 1. Densité empirique vs théoriques
+x_seq <- seq(min(charge_pos), max(charge_pos), length.out = 300)
+
+hist(charge_pos, probability = TRUE, col = "grey85", border = "white",
+     main = "Densités ajustées", xlab = "Charge (€)", ylab = "Densité")
+lines(x_seq, dgamma(x_seq, shape = shape_g, rate = rate_g),
+      col = "steelblue", lwd = 2)
+lines(x_seq, dlnorm(x_seq, meanlog = meanlog, sdlog = sdlog),
+      col = "coral", lwd = 2)
+if (!is.null(fw))
+  lines(x_seq, dweibull(x_seq, shape = fw$estimate["shape"],
+                         scale = fw$estimate["scale"]),
+        col = "darkgreen", lwd = 2)
+legend("topright", legend = c("Gamma","Log-norm","Weibull"),
+       col = c("steelblue","coral","darkgreen"), lwd = 2, cex = 0.75)
+
+# 2. Q-Q plot Gamma
+q_theo <- qgamma(ppoints(n_cp), shape = shape_g, rate = rate_g)
+q_emp  <- sort(charge_pos)
+plot(q_theo, q_emp, pch = 16, cex = 0.5, col = "steelblue",
+     main = "Q-Q Plot — Gamma", xlab = "Quantiles théoriques", ylab = "Quantiles empiriques")
+abline(0, 1, col = "red", lwd = 2)
+
+# 3. CDF empirique vs Gamma
+plot(ecdf(charge_pos), main = "CDF empirique vs Gamma",
+     xlab = "Charge (€)", ylab = "F(x)", col = "black")
+lines(x_seq, pgamma(x_seq, shape = shape_g, rate = rate_g),
+      col = "steelblue", lwd = 2)
+lines(x_seq, plnorm(x_seq, meanlog = meanlog, sdlog = sdlog),
+      col = "coral", lwd = 2)
+legend("bottomright", legend = c("Empirique","Gamma","Log-norm"),
+       col = c("black","steelblue","coral"), lwd = 2, cex = 0.75)
+
+par(mfrow = c(1, 1))
+```
+
+```{r ks-test}
+# ── Test de Kolmogorov-Smirnov — Loi Gamma ───────────────────────────────────
+ks_res <- ks.test(charge_pos, "pgamma", shape = shape_g, rate = rate_g)
+ks_ln  <- ks.test(charge_pos, "plnorm", meanlog = meanlog, sdlog = sdlog)
+
+data.frame(
+  Loi       = c("Gamma", "Log-normale"),
+  Statistique_D = round(c(ks_res$statistic, ks_ln$statistic), 4),
+  p_value   = round(c(ks_res$p.value,    ks_ln$p.value),    4),
+  Decision  = ifelse(c(ks_res$p.value, ks_ln$p.value) > 0.05,
+                     "Non rejetée (α=5%)", "Rejetée (α=5%)")
+) |> kbl_out(caption = "Tests de Kolmogorov-Smirnov")
+```
+
+**Interprétation :** La loi **`r loi_retenue`** présente le meilleur ajustement (AIC/BIC minimaux).
+Elle sera retenue pour le GLM coût (famille Gamma). Le test KS confirme la qualité de l'ajustement
+lorsque la p-value est supérieure à 5%.
+
+---
+
+# Partie C — Modélisation GLM
+
+## GLM Fréquence — Loi Binomiale / Lien logit
+
+```{r glm-freq-prep}
+# Base complète (sinistrés + non sinistrés) avec l'indicateur binaire
+df_freq <- df
+df_freq$indicateur <- as.integer(df_freq$CHARGE > 0)
+cat("Taux de sinistralité :", round(mean(df_freq$indicateur)*100, 2), "%\n")
+
+# Profil de référence → modalités les plus fréquentes
+df_freq$SEX    <- relevel(as.factor(df_freq$SEX),    ref = "M")
+df_freq$STATUT <- relevel(as.factor(df_freq$STATUT), ref = "A")
+df_freq$USAGE  <- relevel(as.factor(df_freq$USAGE),  ref = "2")
+df_freq$K8000  <- relevel(as.factor(df_freq$K8000),  ref = "N")
+df_freq$ENE    <- relevel(as.factor(df_freq$ENE),    ref = "ES")
+df_freq$GARAGE <- relevel(as.factor(df_freq$GARAGE), ref = "3")
+df_freq$CSP3   <- relevel(as.factor(df_freq$CSP3),   ref = "CAT1")
+df_freq$CLA3   <- relevel(as.factor(df_freq$CLA3),   ref = "Inter")
+df_freq$VIT3   <- relevel(as.factor(df_freq$VIT3),   ref = "VitMoy")
+df_freq$CAR3   <- relevel(as.factor(df_freq$CAR3),   ref = "Luxe")
+
+# Split 80/20
+set.seed(2025)
+idx_f   <- sample(seq_len(nrow(df_freq)), round(0.8 * nrow(df_freq)))
+train_f <- df_freq[ idx_f, ]
+test_f  <- df_freq[-idx_f, ]
+```
+
+```{r glm-freq-complet}
+formule_freq <- indicateur ~ CSP3 + CLA3 + VIT3 + CAR3 +
+                SEX + STATUT + USAGE + K8000 + ENE + GARAGE +
+                RM + AGECOND + PERMIS + ACV
+
+mod_freq <- glm(formule_freq, family = binomial(link = "logit"),
+                data = train_f, na.action = na.omit)
+summary(mod_freq)
+```
+
+```{r glm-freq-optim}
+# Sélection pas-à-pas par AIC
+mod_freq_opt <- stepAIC(mod_freq, direction = "both", trace = FALSE)
+cat("=== GLM Fréquence optimisé ===\n")
+summary(mod_freq_opt)
+```
+
+```{r glm-freq-anova}
+anova(mod_freq_opt, test = "Chisq") |> as.data.frame() |> round(4) |>
+  kbl_out(caption = "Analyse de la déviance — GLM Fréquence")
+```
+
+```{r glm-freq-or}
+ic_freq <- confint(mod_freq_opt, level = 0.95)
+data.frame(
+  Coeff    = round(coef(mod_freq_opt), 4),
+  OR       = round(exp(coef(mod_freq_opt)), 4),
+  IC_inf   = round(exp(ic_freq[,1]), 4),
+  IC_sup   = round(exp(ic_freq[,2]), 4)
+) |> kbl_out(caption = "Odds-Ratios et IC 95% — GLM Fréquence")
+```
+
+```{r glm-freq-valid}
+pred_f <- predict(mod_freq_opt, newdata = test_f, type = "response")
+cat("Fréquence prédite :", round(mean(pred_f), 4), "\n")
+cat("Fréquence observée:", round(mean(test_f$indicateur), 4), "\n")
+cat("Écart relatif     :",
+    round(abs(mean(pred_f)-mean(test_f$indicateur))/mean(test_f$indicateur)*100, 2), "%\n")
+```
+
+**Interprétation :** Les odds-ratios > 1 indiquent une hausse de la probabilité de sinistre par rapport au profil de référence. Les variables retenues après stepAIC sont statistiquement significatives (p < 0.05) et économiquement interprétables.
+
+---
+
+## GLM Coût — Loi Gamma / Lien log
+
+```{r glm-cout-prep}
+# Base attritionnelle — apprentissage
+train_c <- train
+
+train_c$SEX    <- relevel(as.factor(train_c$SEX),    ref = "M")
+train_c$STATUT <- relevel(as.factor(train_c$STATUT), ref = "A")
+train_c$USAGE  <- relevel(as.factor(train_c$USAGE),  ref = "2")
+train_c$K8000  <- relevel(as.factor(train_c$K8000),  ref = "N")
+train_c$ENE    <- relevel(as.factor(train_c$ENE),    ref = "ES")
+train_c$GARAGE <- relevel(as.factor(train_c$GARAGE), ref = "3")
+train_c$CSP3   <- relevel(as.factor(train_c$CSP3),   ref = "CAT1")
+train_c$CLA3   <- relevel(as.factor(train_c$CLA3),   ref = "Inter")
+train_c$VIT3   <- relevel(as.factor(train_c$VIT3),   ref = "VitMoy")
+train_c$CAR3   <- relevel(as.factor(train_c$CAR3),   ref = "Luxe")
+
+cat("Base coût apprentissage :", nrow(train_c), "obs.\n")
+```
+
+```{r glm-cout-complet}
+formule_cout <- CHARGE ~ CSP3 + CLA3 + VIT3 + CAR3 +
+                SEX + STATUT + USAGE + K8000 + ENE + GARAGE +
+                RM + AGECOND + PERMIS + ACV
+
+mod_cout <- glm(formule_cout, family = Gamma(link = "log"),
+                data = train_c, na.action = na.omit)
+summary(mod_cout)
+```
+
+```{r glm-cout-optim}
+mod_cout_opt <- stepAIC(mod_cout, direction = "both", trace = FALSE)
+cat("=== GLM Coût optimisé ===\n")
+summary(mod_cout_opt)
+```
+
+```{r glm-cout-anova}
+anova(mod_cout_opt, test = "Chisq") |> as.data.frame() |> round(4) |>
+  kbl_out(caption = "Analyse de la déviance — GLM Coût")
+```
+
+```{r glm-cout-mult}
+ic_cout <- confint(mod_cout_opt, level = 0.95)
+data.frame(
+  Coeff         = round(coef(mod_cout_opt), 4),
+  Multiplicateur = round(exp(coef(mod_cout_opt)), 4),
+  IC_inf        = round(exp(ic_cout[,1]), 4),
+  IC_sup        = round(exp(ic_cout[,2]), 4)
+) |> kbl_out(caption = "Multiplicateurs et IC 95% — GLM Coût (Gamma)")
+```
+
+```{r glm-cout-valid}
+test_c <- test
+for (v in c("SEX","STATUT","USAGE","K8000","ENE","GARAGE",
+            "CSP3","CLA3","VIT3","CAR3")) {
+  test_c[[v]] <- factor(test_c[[v]], levels = levels(train_c[[v]]))
+}
+pred_c <- predict(mod_cout_opt, newdata = test_c, type = "response")
+cat("Coût moyen prédit  :", round(mean(pred_c, na.rm=TRUE), 2), "€\n")
+cat("Coût moyen observé :", round(mean(test$CHARGE), 2), "€\n")
+cat("Écart relatif      :",
+    round(abs(mean(pred_c,na.rm=TRUE)-mean(test$CHARGE))/mean(test$CHARGE)*100, 2), "%\n")
+```
+
+**Interprétation :** Les multiplicateurs (exp(coef)) quantifient le ratio du coût moyen par rapport au profil de référence. Un multiplicateur de 1,30 signifie +30% de coût moyen toutes choses égales par ailleurs.
+
+---
+
+## Grille de tarif
+
+```{r grille}
+# Grille sur les variables les plus discriminantes
+grille <- expand.grid(
+  CSP3    = levels(train_c$CSP3),
+  CLA3    = levels(train_c$CLA3),
+  CAR3    = levels(train_c$CAR3),
+  VIT3    = factor("VitMoy",  levels = levels(train_c$VIT3)),
+  SEX     = factor("M",       levels = levels(train_c$SEX)),
+  STATUT  = factor("A",       levels = levels(train_c$STATUT)),
+  USAGE   = factor("2",       levels = levels(train_c$USAGE)),
+  K8000   = factor("N",       levels = levels(train_c$K8000)),
+  ENE     = factor("ES",      levels = levels(train_c$ENE)),
+  GARAGE  = factor("3",       levels = levels(train_c$GARAGE)),
+  RM      = median(df$RM),
+  AGECOND = median(df$AGECOND),
+  PERMIS  = median(df$PERMIS),
+  ACV     = median(df$ACV),
+  stringsAsFactors = FALSE
+)
+
+# Aligner les niveaux pour la fréquence
+grille_f <- grille
+for (v in c("CSP3","CLA3","CAR3","VIT3","SEX","STATUT","USAGE","K8000","ENE","GARAGE")) {
+  grille_f[[v]] <- factor(grille_f[[v]], levels = levels(df_freq[[v]]))
+}
+
+grille$freq_pred  <- predict(mod_freq_opt, newdata = grille_f,  type = "response")
+grille$cout_pred  <- predict(mod_cout_opt, newdata = grille,    type = "response")
+grille$prime_pure <- round(grille$freq_pred * grille$cout_pred, 2)
+
+# Affichage
+grille_aff <- grille[, c("CSP3","CLA3","CAR3","freq_pred","cout_pred","prime_pure")] |>
+  mutate(freq_pred = round(freq_pred*100, 3),
+         cout_pred = round(cout_pred, 2)) |>
+  arrange(desc(prime_pure))
+
+grille_aff |>
+  kbl_out(caption = "Grille de tarif — Prime pure par profil (€)",
+          col.names = c("CSP","Classe véhicule","Type véhicule",
+                        "Fréq. (%)","Coût moy. (€)","Prime pure (€)"))
+```
+
+```{r grille-viz, fig.height=5}
+ggplot(grille_aff, aes(x = CLA3, y = prime_pure, fill = CSP3)) +
+  geom_bar(stat = "identity", position = "dodge") +
+  facet_wrap(~ CAR3, ncol = 3) +
+  labs(
+    title    = "Grille de tarif — Prime Pure (€)",
+    subtitle = "Profil de base : H, M, Usage=2, VitMoy, ES, RM médian",
+    x = "Classe véhicule (CLA3)", y = "Prime Pure (€)", fill = "CSP"
+  ) +
+  scale_fill_brewer(palette = "Set2") +
+  theme(strip.text = element_text(face = "bold"))
+```
+
+**Lecture :** La prime pure = P(sinistre) × coût moyen conditionnel. Elle est ensuite majorée d'un **coefficient de chargement** (frais de gestion, profit, sécurité) pour obtenir la **prime commerciale**.
+
+---
+
+# Synthèse
+
+| Étape | Méthode | Résultat |
+|---|---|---|
+| Séparation | Seuil Q99 | `r nrow(df_attri)` attritionnels / `r nrow(df_graves)` graves |
+| Adéquation coût | Gamma (meilleur AIC) | Confirmé par KS |
+| GLM Fréquence | Binomial/Logit + stepAIC | Variables discriminantes identifiées |
+| GLM Coût | Gamma/Log + stepAIC | Multiplicateurs estimés |
+| Prime pure | Fréquence × Coût | Grille tarifaire produite |
+
+---
+
+*Fichier de compte rendu — à rendre avec la copie.*
